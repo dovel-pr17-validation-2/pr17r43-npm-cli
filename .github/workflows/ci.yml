@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# windows-latest bills at 2x, so a force-push must not leave the previous run going.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bash scripts/check-naming.sh
+      - run: bun run typecheck
+      - run: bun run lint --max-warnings 0
+      - run: bun run format:check
+      - run: bun run knip
+      - run: bun run test
+      - run: bun run build
+      # Built before the tarball check so its dist/qawolf exclusion is tested
+      # against a real file. Also the only pre-release run of the binary build
+      # on Linux; release-binaries.yml runs on publish only.
+      - name: Build and smoke the binary
+        run: |
+          bun scripts/buildBinary.ts
+          ./dist/qawolf --version
+      # The binary runs web flows in a worker that executes dist/cli.js from a
+      # directory with no node_modules, so a package the bundle imports at
+      # startup fails every flow. test/worker/importSmoke.mjs explains the run.
+      - name: Smoke the worker bundle without node_modules
+        run: bun test/worker/importSmoke.mjs ./dist/qawolf
+      - name: Verify tarball contents
+        run: |
+          output=$(bun pm pack --dry-run 2>&1)
+          echo "$output"
+          echo "$output" | grep -qE 'dist/cli\.js$'
+          ! echo "$output" | grep -qE 'dist/cli\.js\.map$' || exit 1
+          ! echo "$output" | grep -qE 'dist/qawolf$' || exit 1
+      # A peer-dependency conflict can make npm resolve forever at full CPU with
+      # no error, which is how `npm i @qawolf/cli` and `npx @qawolf/cli` broke
+      # (see src/domains/runtimeEnv/pinnedPackages.ts). The time limit turns
+      # that hang into a failure.
+      - name: Smoke — npm installs the packed CLI
+        run: |
+          bun pm pack --filename "$RUNNER_TEMP/cli.tgz" --quiet
+          mkdir "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init -y > /dev/null
+          timeout 300 npm install "$RUNNER_TEMP/cli.tgz" --ignore-scripts --no-audit --no-fund
+      # - name: PR size check
+      #   if: github.event_name == 'pull_request'
+      #   env:
+      #     BASE_REF: ${{ github.base_ref }}
+      #   run: bash scripts/check-pr-size.sh "$BASE_REF"
+      - name: Co-authored-by check
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: bash scripts/check-co-authored.sh "$BASE_REF"
+
+  # Proves the published npm bundle runs on every supported runtime: the bundle
+  # boots and a TypeScript flow transpiles + loads. The node-24 lane pins the
+  # exact engines.node floor (24.14.1) so a regression at the minimum is caught.
+  runtime-smoke:
+    name: Runtime smoke (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: node-24
+            node-version: "24.14.1"
+          - name: bun
+            node-version: ""
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+      - if: matrix.node-version != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Bundle the real registerFlowLoader (oxc-node external) so the smoke drives
+      # the shipped strategy selection, not a copy. Bundling resolves the ~/ alias
+      # that Node/oxc cannot.
+      - name: Bundle flow loader for smoke
+        run: >
+          bun build src/shell/resolver/registerFlowLoader.ts
+          --target=node --format=esm --external @oxc-node/core
+          --outfile test/node20/loader.generated.mjs
+      - name: Smoke — bundle boots + TypeScript flow loads
+        env:
+          RUNTIME: ${{ matrix.name }}
+        run: |
+          if [ "$RUNTIME" = "bun" ]; then
+            bun dist/cli.js --version
+            bun test/node20/smoke.mjs
+          else
+            node dist/cli.js --version
+            node test/node20/smoke.mjs
+          fi
+      # A command whose reply arrives over the network must exit with its own
+      # status code, and must exit at all — see src/shell/exit.ts. The reply is
+      # served locally, so the smoke needs no API key and no network.
+      - name: Smoke — a networked command exits with its own code
+        env:
+          RUNTIME: ${{ matrix.name }}
+        run: |
+          if [ "$RUNTIME" = "bun" ]; then
+            bun test/exit/networkExitSmoke.mjs bun dist/cli.js
+          else
+            node test/exit/networkExitSmoke.mjs
+          fi
+
+  # Only a Windows runner reaches CreateProcess, so only this job catches a
+  # win32 spawn regression. WIZ-11274 (`spawn npm ENOENT`) shipped through that
+  # gap. `test/spawn/cmdEscapeSmoke.mjs` explains the mechanism.
+  #
+  # Every multi-line step sets `shell: bash`. The windows-latest default is
+  # pwsh, which reports only the last command's exit code, so an earlier
+  # failure would pass silently.
+  windows-smoke:
+    name: Windows smoke
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+      # `build` (not build:bundle) so the postbuild hook runs here: only a
+      # Windows runner proves the hook stays executable by bun's script
+      # runner, which cannot shell out to .sh files (release v1.1.0–v1.4.2
+      # Windows binaries all failed on exactly that).
+      - run: bun run build
+      # The only pre-release run of the Windows binary build; release-binaries.yml
+      # runs on publish only.
+      - name: Build and smoke the binary
+        shell: bash
+        run: |
+          bun scripts/buildBinary.ts --outfile dist/qawolf.exe
+          ./dist/qawolf.exe --version
+      # Bundling resolves the `~/` alias Node cannot. Only spawn.ts needs it;
+      # the production-wiring check below runs the shipped bundle instead.
+      - name: Bundle defaultSpawn for smoke
+        shell: bash
+        run: |
+          bun build src/shell/spawn.ts --target=node --format=esm --outfile test/spawn/spawn.generated.mjs
+      - name: Smoke — bundle boots + shipped CLI spawns .cmd
+        shell: bash
+        run: |
+          node dist/cli.js --version
+          node test/spawn/doctorSmoke.mjs
+      - name: Smoke — cmd.exe argument escaping round-trips
+        shell: bash
+        run: node test/spawn/cmdEscapeSmoke.mjs
+      # Only win32 aborts when Node tears down a reply still in flight
+      # ("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\\win\\async.c"),
+      # which replaced the command's exit code with a crash code. Both the npm
+      # build and the released binary are smoked: they ship different I/O stacks.
+      - name: Smoke — a networked command exits with its own code
+        shell: bash
+        run: |
+          node test/exit/networkExitSmoke.mjs
+          node test/exit/networkExitSmoke.mjs ./dist/qawolf.exe
+      # Only Node-on-win32 rejects raw absolute paths in import() ("protocol
+      # 'c:'"), so only this job catches a regression in the file:// URL
+      # conversion. WIZ-11313 shipped through that gap.
+      - name: Bundle testkit loader for smoke
+        shell: bash
+        run: |
+          bun build src/shell/testkit.ts --target=node --format=esm --outfile test/testkit/testkit.generated.mjs
+      - name: Smoke — testkit loads from an absolute win32 path
+        shell: bash
+        run: node test/testkit/loadSmoke.mjs
