@@ -69,7 +69,7 @@
     "version-packages": "changeset version && bun run format"
   },
   "dependencies": {
-    "@clack/prompts": "1.5.1",
+    "@clack/prompts": "1.8.1",
     "@napi-rs/keyring": "1.3.0",
     "@oxc-node/core": "0.1.0",
     "@qawolf/api-contracts": "0.130.0",
